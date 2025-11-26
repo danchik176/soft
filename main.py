@@ -1,8 +1,8 @@
 import asyncio
 import json
 import logging
-import time
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Any
 
@@ -374,24 +374,23 @@ class TradeCopier:
                     except Exception:
                         continue
             except Exception as e:
-                logger.warning(
-                    "Не удалось получить цену входа для аккаунта %s: %s",
-                    follower.uid,
-                    e,
-                )
+                logger.warning("Ошибка получения позиций %s: %s", follower.uid, e)
 
         state = pos_info.follower_positions.get(follower.uid)
-        if state is None:
-            state = FollowerPositionState(uid=follower.uid, requested_vol=vol)
+        if not state:
+            state = FollowerPositionState(
+                uid=follower.uid, requested_vol=vol, position_id=pos_id, entry_price=follower_entry
+            )
             pos_info.follower_positions[follower.uid] = state
-        state.position_id = pos_id
-        state.entry_price = follower_entry
+        else:
+            state.position_id = pos_id
+            state.entry_price = follower_entry
 
         return {
             "status": "ok",
             "uid": follower.uid,
-            "position_id": pos_id,
             "entry_price": follower_entry,
+            "requested_vol": vol,
         }
 
     # --- Закрытие на ведомых ---
@@ -609,22 +608,23 @@ class TradeCopier:
                     res_by_uid[res["uid"]] = res
 
             # --- Сообщение об открытии ---
+            # --- Сообщение об открытии ---
             lines: List[str] = [
-                f"🚀 <b>Открытие позиции</b> {symbol} side={side} x{leverage}",
+                f"Открытие позиции <b>{symbol}</b> side=<b>{side}</b> x<b>{leverage}</b>",
                 "",
+                "<b>Главный аккаунт:</b>",
             ]
 
-            # Главный
-            main_entry_display = (
-                str(main_entry_price) if main_entry_price is not None else "н/д"
-            )
-            lines.append("<b>Главный аккаунт</b>:")
-            lines.append(f"  Объём: {vol}")
-            lines.append(f"  Вход: {main_entry_display}")
+            main_value_usdt = vol * main_entry_price if main_entry_price else 0.0
+            main_margin = main_value_usdt / leverage if leverage > 0 else 0.0
 
-            # Ведомые
-            lines.append("")
-            lines.append("<b>Ведомые аккаунты:</b>")
+            lines += [
+                f"  Объём: <b>{main_value_usdt:,.4f} USDT</b>".replace(",", " "),
+                f"  Маржа: <b>{main_margin:,.4f} $</b>".replace(",", " "),
+                f"  Вход: <b>{main_entry_price:.6f}</b>" if main_entry_price else "  Вход: <b>н/д</b>",
+                "",
+                "<b>Ведомые аккаунты:</b>",
+            ]
 
             for idx, follower in enumerate(self.followers, start=1):
                 uid = follower.uid
@@ -632,19 +632,22 @@ class TradeCopier:
                 res = res_by_uid.get(uid)
 
                 if res and res.get("status") == "error":
-                    lines.append(f"{idx}) ❌ ошибка открытия ({res.get('error')})")
+                    lines.append(f"{idx}) <b>ошибка открытия</b>")
+                    continue
+                if not state or state.entry_price is None:
+                    lines.append(f"{idx}) <b>не открыто</b>")
                     continue
 
-                if not state:
-                    lines.append(f"{idx}) нет данных по позиции")
-                    continue
+                f_entry = state.entry_price
+                f_value_usdt = state.requested_vol * f_entry
+                f_margin = f_value_usdt / leverage if leverage > 0 else 0.0
 
-                entry = state.entry_price
-                f_vol = state.requested_vol
+                value_str = f"{f_value_usdt:,.4f}".replace(",", " ")
+                margin_str = f"{f_margin:,.4f}".replace(",", " ")
 
-                entry_display = str(entry) if entry is not None else "н/д"
-                line = f"{idx}) объём={f_vol}, вход={entry_display}"
-                lines.append(line)
+                lines.append(
+                    f"{idx}) Объём: <b>{value_str} USDT</b> Маржа: <b>{margin_str} $</b> Твх: <b>{f_entry:.6f}</b>"
+                )
 
             msg = "\n".join(lines)
             await self._send_telegram_message(msg)
@@ -668,6 +671,39 @@ class TradeCopier:
                 sync_info.symbol,
             )
 
+            # Получаем данные о закрытии для главного аккаунта
+            main_exit_price = None
+            main_pnl = None
+            main_vol = sync_info.main_vol
+            position_type = 1 if sync_info.side == 1 else 2  # 1=long, 2=short
+
+            await asyncio.sleep(2)  # Ждем, пока позиция попадет в историю
+
+            now_ms = int(time.time() * 1000)
+            start_time = now_ms - 3600_000  # 1 час назад
+            end_time = now_ms
+
+            try:
+                history = await self.main.mexc.get_history_positions(
+                    symbol=sync_info.symbol,
+                    position_type=position_type,
+                    start_time=start_time,
+                    end_time=end_time,
+                    page_size=50,
+                )
+
+                for h in history:
+                    if str(h.get("positionId")) == closed_pos_id and h.get("state") == 3:
+                        main_exit_price = _extract_first_float(
+                            h, ["closeAvgPrice", "avgClosePrice", "exitPrice"]
+                        )
+                        main_pnl = _extract_first_float(
+                            h, ["realised", "closeProfitLoss", "pnl", "profit"]
+                        )
+                        break
+            except Exception as e:
+                logger.warning("Ошибка получения истории позиций для главного аккаунта: %s", e)
+
             close_tasks: List[asyncio.Task] = [
                 self._close_on_follower(follower, sync_info)
                 for follower in self.followers
@@ -679,55 +715,60 @@ class TradeCopier:
 
             # --- Сообщение о закрытии ---
             lines: List[str] = [
-                f"✅ <b>Закрытие позиции</b> {sync_info.symbol} side={sync_info.side} x{sync_info.leverage}",
+                f"Закрытие позиции <b>{sync_info.symbol}</b> side=<b>{sync_info.side}</b> x<b>{sync_info.leverage}</b>",
                 "",
-                "<b>Результаты по ведомым аккаунтам:</b>",
+                "<b>Главный аккаунт:</b>",
+            ]
+
+            main_value_usdt = sync_info.main_vol * (sync_info.main_entry_price or 0)
+            main_margin = main_value_usdt / sync_info.leverage if sync_info.leverage > 0 else 0.0
+
+            lines += [
+                f"  Объём: <b>{main_value_usdt:,.4f} USDT</b>".replace(",", " "),
+                f"  Маржа: <b>{main_margin:,.4f} $</b>".replace(",", " "),
+                f"  Выход: <b>{main_exit_price:.6f}</b>" if main_exit_price else "  Выход: <b>н/д</b>",
+                f"  PnL: <b>{main_pnl:+.2f} $</b>" if main_pnl is not None else "  PnL: <b>н/д</b>",
+                "",
+                "<b>Ведомые аккаунты:</b>",
             ]
 
             for res in results:
                 if not isinstance(res, dict):
                     continue
-
                 status = res.get("status")
                 uid = res.get("uid", "?")
                 idx = index_by_uid.get(uid, "?")
 
-                if status == "ok":
-                    positions = res.get("positions", [])
-                    if not positions:
-                        lines.append(f"{idx}) нет позиций для закрытия")
+                if status != "ok" or not res.get("positions"):
+                    reason = "нет позиции" if status == "no_position" else "ошибка"
+                    lines.append(f"{idx}) <b>{reason}</b>")
+                    continue
+
+                for p in res["positions"]:
+                    if p.get("status") != "ok":
+                        lines.append(f"{idx}) <b>ошибка закрытия</b>")
                         continue
 
-                    for p in positions:
-                        if p.get("status") == "ok":
-                            exit_price = p.get("exit_price")
-                            pnl = p.get("pnl")
-                            vol = p.get("vol")
+                    vol = p.get("vol")
+                    exit_price = p.get("exit_price")
+                    pnl = p.get("pnl")
 
-                            exit_display = (
-                                str(exit_price) if exit_price is not None else "н/д"
-                            )
-                            pnl_display = str(pnl) if pnl is not None else "н/д"
+                    state = sync_info.follower_positions.get(uid)
+                    entry_price = state.entry_price if state else None
+                    value_usdt = vol * (entry_price or 0)
+                    margin = value_usdt / sync_info.leverage if sync_info.leverage > 0 else 0.0
 
-                            line = f"{idx}) объём={vol}, выход={exit_display}, PnL={pnl_display}"
-                            lines.append(line)
-                        else:
-                            err = p.get("error")
-                            pos_id = p.get("position_id")
-                            lines.append(
-                                f"{idx}) ❌ ошибка закрытия позиции {pos_id} ({err})"
-                            )
+                    value_str = f"{value_usdt:,.4f}".replace(",", " ")
+                    margin_str = f"{margin:,.4f}".replace(",", " ")
+                    exit_str = f"{exit_price:.6f}" if exit_price else "н/д"
+                    pnl_str = f"{pnl:+.2f}" if pnl is not None else "н/д"
 
-                elif status == "no_position":
-                    lines.append(f"{idx}) нет открытых позиций для закрытия")
-                elif status == "error":
                     lines.append(
-                        f"{idx}) ❌ ошибка при получении/закрытии ({res.get('error')})"
+                        f"{idx}) Объём: <b>{value_str} USDT</b> Маржа: <b>{margin_str} $</b> Твх: <b>{exit_str}</b> PnL: <b>{pnl_str} $</b>"
                     )
 
             msg = "\n".join(lines)
             await self._send_telegram_message(msg)
-
             self.opened_positions.pop(closed_pos_id, None)
 
     # --- Один шаг цикла ---
