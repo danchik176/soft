@@ -2,6 +2,7 @@ import hashlib
 import json
 import time
 from curl_cffi import AsyncSession
+import asyncio
 
 
 class Mexc:
@@ -50,6 +51,45 @@ class Mexc:
         sign = self.md5(date_now + s + g)
         return {'time': date_now, 'sign': sign}
 
+    async def get_order_history(self, symbol: str = None, limit: int = 10):
+        """Получение истории ордеров"""
+        url = "https://www.mexc.com/api/platform/futures/api/v1/private/order/list/history_orders"
+        params = {
+            'page_num': 1,
+            'page_size': limit,
+            'state': 3  # Выполненные ордера (state=3)
+        }
+        if symbol:
+            params['symbol'] = symbol
+
+        r = await self._request_with_retry('GET', url, params=params)
+        r_json = r.json()
+
+        if not r_json.get("success"):
+            print(f"❌ Ошибка получения истории ордеров: {r_json.get('message', 'Unknown error')}")
+            return []
+
+        return r_json.get("data", [])
+    async def _request_with_retry(self, method, url, max_retries=3, timeout=10, **kwargs):
+        """Выполняет запрос с retry логикой и таймаутом"""
+        for attempt in range(max_retries):
+            try:
+                if method.upper() == 'GET':
+                    response = await self.ses.get(url, timeout=timeout, **kwargs)
+                elif method.upper() == 'POST':
+                    response = await self.ses.post(url, timeout=timeout, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+                return response
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    print(f"⚠️ Ошибка запроса (попытка {attempt + 1}/{max_retries}): {e}. Повтор через {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"❌ Все попытки запроса исчерпаны: {e}")
+                    raise
+
     async def place_order(self, obj):
         signature = self.mexc_crypto(self.cookies["u_id"], obj)
         headers = {
@@ -59,23 +99,36 @@ class Mexc:
             'Authorization': self.cookies["u_id"],
         }
 
-        # Создаём новую сессию для каждого ордера и автоматически закрываем
-        async with AsyncSession(
-            proxy=self.proxy,
-            headers=headers,
-            cookies=self.cookies,
-            impersonate="chrome136",
-            verify=False
-        ) as ses:
-            r = await ses.post(
-                "https://futures.mexc.com/api/v1/private/order/create", json=obj)
-            return r
+        # Создаём новую сессию для каждого ордера с retry логикой
+        for attempt in range(3):
+            try:
+                async with AsyncSession(
+                    proxy=self.proxy,
+                    headers=headers,
+                    cookies=self.cookies,
+                    impersonate="chrome136",
+                    verify=False
+                ) as ses:
+                    r = await ses.post(
+                        "https://futures.mexc.com/api/v1/private/order/create",
+                        json=obj,
+                        timeout=10
+                    )
+                    return r
+            except Exception as e:
+                if attempt < 2:
+                    wait_time = 2 ** attempt
+                    print(f"⚠️ Ошибка place_order (попытка {attempt + 1}/3): {e}. Повтор через {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"❌ Все попытки place_order исчерпаны: {e}")
+                    raise
 
-    async def open_position(self, symbol: str, side: int, leverage: int, stop_loss_price: str, vol: int):
+    async def open_position(self, symbol: str, side: int, leverage: int, stop_loss_price: str, vol: int, open_type: int):
         # ЛОНГ; МАРЖА 3$; пчеле 3x; позиция 11$; стоп лосс 101 454,1;
 
         # side; 1 - LONG; 3 - SHORT; 4 - CLOSE LONG; 2 - CLOSE SHORT;
-        # openType; 1 - market;
+        # openType; 1 - isolated margin, 2 - cross margin;
         # type; 5 - хз что это;
         # vol; одна единица vol, равняется 11$; 10 vol = 110$;
         # leverage; кредитное плечо;
@@ -100,7 +153,7 @@ class Mexc:
         object = {
             "symbol": symbol,
             "side": side,
-            "openType": 2,
+            "openType": open_type,
             "type": "5",
             "vol": vol,
             "leverage": leverage,
@@ -121,7 +174,40 @@ class Mexc:
 
         return await self.place_order(object)
 
-    async def close_position(self, symbol: str, position_id: int, leverage: int, vol: int, side: int):
+    async def open_position_limit(self, symbol: str, side: int, leverage: int, price: str, vol: int, open_type: int):
+        # side; 1 - LONG; 3 - SHORT; 4 - CLOSE LONG; 2 - CLOSE SHORT;
+        # openType; 1 - isolated margin, 2 - cross margin;
+        # type; 1 - limit, 5 - market;
+        # vol; одна единица vol, равняется 11$; 10 vol = 110$;
+        # leverage; кредитное плечо;
+        # price; цена ордера;
+        template = {
+            'symbol': 'BTC_USDT',
+            'side': 1,
+            'openType': 1,
+            'type': 1,
+            'vol': 8,
+            'leverage': 5,
+            'marketCeiling': False,
+            'price': '90000',
+            'priceProtect': '0',
+        }
+
+        object = {
+            "symbol": symbol,
+            "side": side,
+            "openType": open_type,
+            "type": 1,
+            "vol": vol,
+            "leverage": leverage,
+            "marketCeiling": False,
+            "price": price,
+            "priceProtect": "0",
+        }
+
+        return await self.place_order(object)
+
+    async def close_position(self, symbol: str, position_id: int, leverage: int, vol: int, side: int, open_type: int):
         # side; 1 - LONG; 3 - SHORT; 4 - CLOSE LONG; 2 - CLOSE SHORT;
         template = {
             'symbol': 'BTC_USDT',
@@ -137,7 +223,7 @@ class Mexc:
 
         object = {
             "symbol": symbol,
-            "openType": 1,
+            "openType": open_type,
             "positionId": position_id,
             "leverage": leverage,
             "type": 5,
@@ -153,8 +239,8 @@ class Mexc:
         # Используем новый эндпоинт для получения открытых позиций
         url = "https://www.mexc.com/api/platform/futures/api/v1/private/position/open_positions"
 
-        # Не передаём параметры - они уже в self.ses
-        r = await self.ses.get(url)
+        # Используем retry логику
+        r = await self._request_with_retry('GET', url)
         r_json = r.json()
 
         # print(f"📊 get_open_positions response: {r_json}")
@@ -200,6 +286,7 @@ class Mexc:
                 'side': 1 if position_type == 1 else 3,  # Конвертируем positionType в side
                 'vol': position.get('holdVol'),
                 'leverage': position.get('leverage'),
+                'openType': position.get('openType'),
                 'openAvgPrice': position.get('openAvgPrice'),
                 'holdVol': position.get('holdVol'),
                 'holdAvgPrice': position.get('holdAvgPrice'),
@@ -212,59 +299,130 @@ class Mexc:
 
         return formatted_positions
 
-    async def get_history_positions(
-            self,
-            symbol: str = None,
-            position_type: int = None,  # 1: long, 2: short
-            start_time: int = None,
-            end_time: int = None,
-            page_num: int = 1,
-            page_size: int = 100
-    ):
-        """📊 Получение исторических позиций"""
-        url = "https://www.mexc.com/api/platform/futures/api/v1/private/position/list/history_positions"
-
-        params = {
-            "page_num": page_num,
-            "page_size": page_size,
-        }
-        if symbol:
-            params["symbol"] = symbol
-        if position_type:
-            params["position_type"] = position_type  # Используем position_type, как в API
-        if start_time:
-            params["start_time"] = start_time
-        if end_time:
-            params["end_time"] = end_time
-
-        r = await self.ses.get(url, params=params)
+    async def get_open_orders(self):
+        url = "https://www.mexc.com/api/platform/futures/api/v1/private/order/list/open_orders?page_size=200"
+        r = await self._request_with_retry('GET', url)
         r_json = r.json()
 
         if not r_json.get("success"):
-            print(f"❌ Ошибка получения исторических позиций: {r_json.get('message', 'Unknown error')}")
+            print(
+                f"❌ Ошибка получения ордеров: {r_json.get('message', 'Unknown error')}")
             return []
 
-        positions = r_json.get("data", [])
+        orders = r_json.get("data", [])
+        return orders
+        # {
+        #     "success": true,
+        #     "code": 0,
+        #     "data": [
+        #         {
+        #             "orderId": "746397375190355968",
+        #             "symbol": "BTC_USDT",
+        #             "positionId": 0,
+        #             "price": 90000,
+        #             "priceStr": "90000",
+        #             "vol": 7,
+        #             "leverage": 5,
+        #             "side": 1,
+        #             "category": 1,
+        #             "orderType": 1,
+        #             "dealAvgPrice": 0,
+        #             "dealAvgPriceStr": "0",
+        #             "dealVol": 0,
+        #             "orderMargin": 12.6504,
+        #             "takerFee": 0,
+        #             "makerFee": 0,
+        #             "profit": 0,
+        #             "feeCurrency": "USDT",
+        #             "openType": 1,
+        #             "state": 2,
+        #             "externalOid": "_m_02ce823c004a4b21ae4c8c85da910231",
+        #             "errorCode": 0,
+        #             "usedMargin": 0,
+        #             "createTime": 1763625401575,
+        #             "updateTime": 1763625401652,
+        #             "positionMode": 1,
+        #             "version": 1,
+        #             "showCancelReason": 0,
+        #             "showProfitRateShare": 0,
+        #             "bboTypeNum": 0,
+        #             "totalFee": 0,
+        #             "zeroSaveTotalFeeBinance": 0,
+        #             "zeroTradeTotalFeeBinance": 0
+        #         }
+        #     ]
+        # }
 
-        # Форматируем аналогично open_positions
-        formatted_positions = []
-        for position in positions:
-            position_type = position.get('positionType')
-            formatted_position = {
-                'positionId': position.get('positionId'),
-                'symbol': position.get('symbol'),
-                'side': 1 if position_type == 1 else 3,  # Конвертируем в ваш side
-                'vol': position.get('holdVol'),
-                'leverage': position.get('leverage'),
-                'openAvgPrice': position.get('openAvgPrice'),
-                'holdVol': position.get('holdVol'),
-                'holdAvgPrice': position.get('holdAvgPrice'),
-                'closeAvgPrice': position.get('closeAvgPrice'),  # Добавляем для exit_price
-                'realised': position.get('realised'),  # PnL
-                'closeProfitLoss': position.get('closeProfitLoss'),
-                'state': position.get('state'),  # 3 = closed
-                # Другие поля, если нужно
-            }
-            formatted_positions.append(formatted_position)
+    async def cancel_order(self, order_ids: list):
+        """Отмена ордеров по списку ID"""
+        signature = self.mexc_crypto(self.cookies["u_id"], order_ids)
+        headers = {
+            'Content-Type': 'application/json',
+            'x-mxc-sign': signature['sign'],
+            'x-mxc-nonce': signature['time'],
+            'Authorization': self.cookies["u_id"],
+        }
 
-        return formatted_positions
+        for attempt in range(3):
+            try:
+                async with AsyncSession(
+                    proxy=self.proxy,
+                    headers=headers,
+                    cookies=self.cookies,
+                    impersonate="chrome136",
+                    verify=False
+                ) as ses:
+                    r = await ses.post(
+                        "https://www.mexc.com/api/platform/futures/api/v1/private/order/cancel",
+                        json=order_ids,
+                        timeout=10
+                    )
+                    return r
+            except Exception as e:
+                if attempt < 2:
+                    wait_time = 2 ** attempt
+                    print(f"⚠️ Ошибка cancel_order (попытка {attempt + 1}/3): {e}. Повтор через {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"❌ Все попытки cancel_order исчерпаны: {e}")
+                    raise
+
+    async def change_limit_order(self, order_id: str, price: str, vol: int):
+        """Изменение лимитного ордера. Возвращает новый orderId"""
+        obj = {
+            "orderId": order_id,
+            "price": price,
+            "vol": vol
+        }
+
+        signature = self.mexc_crypto(self.cookies["u_id"], obj)
+        headers = {
+            'Content-Type': 'application/json',
+            'x-mxc-sign': signature['sign'],
+            'x-mxc-nonce': signature['time'],
+            'Authorization': self.cookies["u_id"],
+        }
+
+        for attempt in range(3):
+            try:
+                async with AsyncSession(
+                    proxy=self.proxy,
+                    headers=headers,
+                    cookies=self.cookies,
+                    impersonate="chrome136",
+                    verify=False
+                ) as ses:
+                    r = await ses.post(
+                        "https://www.mexc.com/api/platform/futures/api/v1/private/order/change_limit_order",
+                        json=obj,
+                        timeout=10
+                    )
+                    return r
+            except Exception as e:
+                if attempt < 2:
+                    wait_time = 2 ** attempt
+                    print(f"⚠️ Ошибка change_limit_order (попытка {attempt + 1}/3): {e}. Повтор через {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"❌ Все попытки change_limit_order исчерпаны: {e}")
+                    raise
