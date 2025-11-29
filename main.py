@@ -1,909 +1,608 @@
 import asyncio
-import json
-import logging
-import os
-import time
-from dataclasses import dataclass, field
-from typing import Dict, Optional, List, Any
-
 from api.mexc import Mexc
-import config
-
-# === Конфиг из config.py ===
-
-DELAY_BETWEEN_CHECK_POSITIONS: float = getattr(
-    config, "DELAY_BETWEEN_CHECK_POSITIONS", 0.3
-)
-ACCOUNTS_DIR: str = getattr(config, "ACCOUNTS_DIR", "./accounts")
-MAIN_ACCOUNT_FILE: str = getattr(config, "MAIN_ACCOUNT_FILE", "main.txt")
-MAX_CONCURRENT_REQUESTS: int = getattr(config, "MAX_CONCURRENT_REQUESTS", 5)
-
-TELEGRAM_BOT_TOKEN: str = getattr(config, "TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID: str = getattr(config, "TELEGRAM_CHAT_ID", "")
-
-# "market" или "limit"
-ORDER_TYPE: str = getattr(config, "ORDER_TYPE", "market")
-# Смещение цены лимитки от цены входа главной позиции (например, -0.1)
-LIMIT_ORDER_PRICE_OFFSET: float = getattr(
-    config, "LIMIT_ORDER_PRICE_OFFSET", 0.0
+import os
+import requests
+import random
+from config import (
+    DELAY_BETWEEN_CHECK_POSITIONS,
+    VOL_RANDOM_MIN,
+    VOL_RANDOM_MAX,
+    LEVERAGE_RANDOM_MIN,
+    LEVERAGE_RANDOM_MAX,
+    TELEGRAM_CHAT_ID,
+    TELEGRAM_BOT_TOKEN
 )
 
-
-# === Логгер ===
-
-def setup_logger() -> logging.Logger:
-    logger = logging.getLogger("trade_copier")
-    if logger.handlers:
-        return logger  # уже настроен
-
-    logger.setLevel(logging.INFO)
-
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
-    logger.addHandler(console)
-
-    file_handler = logging.FileHandler("trade_copier.log", encoding="utf-8")
-    file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
-
-    return logger
+# === TELEGRAM ===
 
 
-logger = setup_logger()
+async def send_telegram_message(message):
+    """Отправка сообщения в Telegram"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML'
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"❌ Ошибка отправки в Telegram: {response.text}")
+    except Exception as e:
+        print(f"❌ Ошибка отправки в Telegram: {e}")
 
-
-# === Датаклассы ===
-
-@dataclass
-class Account:
-    uid: str
-    proxy: Optional[str] = None
-    size_multiplier: float = 1.0
-    mexc: Mexc = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.mexc = Mexc(self.uid, self.proxy)
-
-
-@dataclass
-class FollowerPositionState:
-    uid: str
-    requested_vol: float
-    position_id: Optional[str] = None
-    entry_price: Optional[float] = None
-
-
-@dataclass
-class PositionSyncInfo:
-    symbol: str
-    side: int
-    leverage: int
-    main_entry_price: Optional[float]
-    main_vol: float
-    follower_positions: Dict[str, FollowerPositionState] = field(
-        default_factory=dict
-    )
-
-
-# === Парсинг аккаунтов ===
-
-def parse_account_line(line: str):
-    """
-    Формат строк:
-      uid|proxy
-      uid|proxy|multiplier
-    proxy можно не указывать (uid или uid|)
-    """
-    parts = line.strip().split("|")
-    if not parts or not parts[0].strip():
-        return None
-
-    uid = parts[0].strip()
-    proxy = None
-    if len(parts) > 1 and parts[1].strip():
-        proxy = parts[1].strip()
-
-    multiplier = 1.0
-    if len(parts) > 2 and parts[2].strip():
-        try:
-            multiplier = float(parts[2].strip())
-        except ValueError:
-            logger.warning(
-                "Не удалось распарсить multiplier '%s' для uid %s, использую 1.0",
-                parts[2],
-                uid,
-            )
-
-    return uid, proxy, multiplier
-
-
-def load_main_account() -> Account:
-    path = os.path.join(ACCOUNTS_DIR, MAIN_ACCOUNT_FILE)
-    if not os.path.exists(path):
-        raise RuntimeError(f"Не найден файл главного аккаунта: {path}")
-
-    uid = proxy = None
-    multiplier = 1.0
-
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
+def load_accounts():
+    accounts = []
+    accounts_dir = "./accounts"
+    for filename in os.listdir(accounts_dir):
+        filepath = os.path.join(accounts_dir, filename)
+        if os.path.isfile(filepath):
+            if filename == "main.txt":
                 continue
-            parsed = parse_account_line(line)
-            if not parsed:
-                continue
-            uid, proxy, multiplier = parsed
-            break  # первая валидная строка
-
-    if not uid:
-        raise RuntimeError(f"В {path} нет ни одной валидной строки с аккаунтом")
-
-    acc = Account(uid=uid, proxy=proxy, size_multiplier=multiplier)
-    logger.info("Главный аккаунт: %s (proxy=%s)", acc.uid, acc.proxy)
-    return acc
-
-
-def load_follower_accounts() -> List[Account]:
-    accounts: List[Account] = []
-    if not os.path.isdir(ACCOUNTS_DIR):
-        raise RuntimeError(f"Папка с аккаунтами не найдена: {ACCOUNTS_DIR}")
-
-    for filename in os.listdir(ACCOUNTS_DIR):
-        if filename == MAIN_ACCOUNT_FILE:
-            continue
-        filepath = os.path.join(ACCOUNTS_DIR, filename)
-        if not os.path.isfile(filepath):
-            continue
-
-        with open(filepath, "r", encoding="utf-8") as file:
-            for line in file:
-                if not line.strip():
-                    continue
-                parsed = parse_account_line(line)
-                if not parsed:
-                    continue
-                uid, proxy, multiplier = parsed
-                accounts.append(Account(uid=uid, proxy=proxy, size_multiplier=multiplier))
-
-    if not accounts:
-        logger.warning("Не найдено ни одного ведомого аккаунта в %s", ACCOUNTS_DIR)
-    else:
-        logger.info("Загружено %d ведомых аккаунтов", len(accounts))
-
+            with open(filepath, "r") as file:
+                for line in file:
+                    parts = line.strip().split("|")
+                    if parts and parts[0]:
+                        uid = parts[0]
+                        proxy = parts[1] if len(parts) > 1 else None
+                        accounts.append((uid, proxy))
     return accounts
 
 
-# === Вспомогательные функции ===
+async def open_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, stop_loss_price, vol, open_type):
+    tasks = []
+    print(
+        f"🚀 Открываем позицию {symbol} ({side}) для всех аккаунтов | SL={stop_loss_price} | базовый vol={vol} | базовый leverage={leverage} | openType={open_type}")
 
-def _extract_first_float(data: dict, keys: List[str]) -> Optional[float]:
-    """
-    Пытаемся вытащить число из словаря по списку возможных ключей.
-    Если по прямым ключам не нашли — пытаемся угадать по подстрокам
-    (entry/open/price, exit/close/price, pnl/profit и т.д.).
-    """
-    # 1. Сначала пробуем строго по заданным ключам
-    for key in keys:
-        if key in data and data[key] is not None:
-            try:
-                return float(data[key])
-            except (TypeError, ValueError):
-                continue
+    # Получаем текущую цену и маржу для главного аккаунта из истории ордеров
+    main_margin = "N/A"
+    main_entry_price = "N/A"
 
-    # 2. Если не нашли — включаем "умную" эвристику по подстрокам
-    lower_keys = [str(k).lower() for k in keys]
-    fallback_substrings: List[str] = []
+    try:
+        main_orders = await main_mexc.get_order_history(symbol, limit=5)
+        # Ищем последний открывающий ордер
+        open_orders = [order for order in main_orders if order.get('side') in [1, 3] and order.get('state') == 3]
+        if open_orders:
+            latest_open = open_orders[0]
+            main_entry_price = latest_open.get('dealAvgPrice', latest_open.get('dealAvgPriceStr', 'N/A'))
+            main_margin = latest_open.get('orderMargin', 'N/A')
+    except Exception as e:
+        print(f"⚠️ Ошибка получения данных главного аккаунта: {e}")
 
-    # Определяем, что мы ищем: цену входа, выхода или PnL
-    if any("pnl" in k or "profit" in k for k in lower_keys):
-        # всё, что похоже на PnL / profit
-        fallback_substrings = ["pnl", "profit"]
-    elif any("exit" in k or "close" in k for k in lower_keys):
-        # цена выхода
-        fallback_substrings = ["exit", "close", "price"]
-    elif any("entry" in k or "open" in k for k in lower_keys):
-        # цена входа
-        fallback_substrings = ["entry", "open", "price"]
-    elif any("price" in k for k in lower_keys):
-        # просто какая-то цена
-        fallback_substrings = ["price"]
+    account_results = []
 
-    if not fallback_substrings:
-        return None
+    for mexc in mexcs:
+        # Генерируем случайный leverage для каждого аккаунта
+        random_leverage = random.randint(LEVERAGE_RANDOM_MIN, LEVERAGE_RANDOM_MAX)
 
-    # 3. Ищем по всем ключам словаря что-то подходящее по имени
-    for k, v in data.items():
-        if v is None:
-            continue
-        lk = str(k).lower()
-        if any(sub in lk for sub in fallback_substrings):
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                continue
+        # Генерируем случайное изменение vol в процентах
+        vol_change_percent = random.randint(VOL_RANDOM_MIN, VOL_RANDOM_MAX)
+        random_vol = int(vol * (1 + vol_change_percent / 100))
 
-    return None
+        # Убеждаемся что vol >= 1
+        random_vol = max(1, random_vol)
 
+        print(f"  📊 Аккаунт: leverage={random_leverage}, vol={random_vol} ({vol_change_percent:+d}%)")
 
-def _extract_position_id(data: dict) -> Optional[str]:
-    for key in ("positionId", "id", "orderId"):
-        if key in data and data[key]:
-            return str(data[key])
-    return None
+        tasks.append(mexc.open_position(
+            symbol, side, random_leverage, stop_loss_price, random_vol, open_type))
+        account_results.append((random_leverage, random_vol))
 
+    results = await asyncio.gather(*tasks)
 
-# === Основной класс копировщика ===
-
-class TradeCopier:
-    def __init__(self, main: Account, followers: List[Account]) -> None:
-        self.main = main
-        self.followers = followers
-        self.opened_positions: Dict[str, PositionSyncInfo] = {}
-        self.sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
-    # --- Telegram ---
-
-    async def _send_telegram_message(self, text: str) -> None:
-        """Отправка одного сообщения в Telegram (HTML-разметка)."""
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            return
-
-        import urllib.request
-        import urllib.error
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-        }
-
-        def _do_request():
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    resp.read()
-            except urllib.error.URLError as e:
-                logger.error("Ошибка отправки сообщения в Telegram: %s", e)
-
-        await asyncio.to_thread(_do_request)
-
-    # --- Открытие на ведомых ---
-
-    async def _open_on_follower(
-        self,
-        follower: Account,
-        symbol: str,
-        side: int,
-        leverage: int,
-        stop_loss_price: Optional[float],
-        vol: float,
-        main_entry_price: Optional[float],
-        pos_info: PositionSyncInfo,
-    ) -> Dict[str, Any]:
-        async with self.sem:
-            try:
-                if ORDER_TYPE == "limit" and main_entry_price is not None:
-                    limit_price = main_entry_price + LIMIT_ORDER_PRICE_OFFSET
-                    try:
-                        result = await follower.mexc.open_position(
-                            symbol,
-                            side,
-                            leverage,
-                            stop_loss_price,
-                            vol,
-                            order_type="limit",
-                            price=limit_price,
-                        )
-                    except TypeError:
-                        result = await follower.mexc.open_position(
-                            symbol, side, leverage, stop_loss_price, vol
-                        )
-                else:
-                    result = await follower.mexc.open_position(
-                        symbol, side, leverage, stop_loss_price, vol
-                    )
-            except Exception as e:
-                logger.exception(
-                    "Ошибка открытия позиции на аккаунте %s: %s",
-                    follower.uid,
-                    e,
-                )
-                return {"status": "error", "uid": follower.uid, "error": str(e)}
-
-        data = result.json() if hasattr(result, "json") else result
-        if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except json.JSONDecodeError:
-                data = {}
-
-        if isinstance(data, dict):
-            container = data.get("data") or data.get("result") or data
-        else:
-            container = {}
-
-        follower_entry = _extract_first_float(
-            container,
-            [
-                "entryPrice",
-                "avgPrice",
-                "price",
-                "openPrice",
-                "avgEntryPrice",
-                "avgOpenPrice",
-            ],
-        )
-        pos_id = _extract_position_id(container)
-
-        # если цену входа не дали в ответе, пробуем взять из открытых позиций
-        if follower_entry is None:
-            try:
-                async with self.sem:
-                    positions = await follower.mexc.get_open_positions()
-                for pos in positions:
-                    try:
-                        if (
-                            pos.get("symbol") == symbol
-                            and int(pos.get("side")) == side
-                            and int(pos.get("leverage")) == leverage
-                        ):
-                            follower_entry = _extract_first_float(
-                                pos,
-                                [
-                                    "entryPrice",
-                                    "avgPrice",
-                                    "price",
-                                    "openPrice",
-                                    "avgEntryPrice",
-                                    "avgOpenPrice",
-                                ],
-                            )
-                            break
-                    except Exception:
-                        continue
-            except Exception as e:
-                logger.warning("Ошибка получения позиций %s: %s", follower.uid, e)
-
-        state = pos_info.follower_positions.get(follower.uid)
-        if not state:
-            state = FollowerPositionState(
-                uid=follower.uid, requested_vol=vol, position_id=pos_id, entry_price=follower_entry
-            )
-            pos_info.follower_positions[follower.uid] = state
-        else:
-            state.position_id = pos_id
-            state.entry_price = follower_entry
-
-        return {
-            "status": "ok",
-            "uid": follower.uid,
-            "entry_price": follower_entry,
-            "requested_vol": vol,
-        }
-
-    # --- Закрытие на ведомых ---
-
-    async def _close_on_follower(
-        self,
-        follower: Account,
-        sync_info: PositionSyncInfo,
-    ) -> Dict[str, Any]:
-        """Закрываем все позиции на ведомом по symbol/side/leverage."""
-        close_side = 4 if sync_info.side == 1 else 2
-        position_type = 1 if sync_info.side == 1 else 2  # Для API: 1=long, 2=short
-
+    # Получаем маржу и цены входа для ведомых аккаунтов из истории ордеров
+    slave_data = []
+    for mexc, (acc_leverage, acc_vol) in zip(mexcs, account_results):
         try:
-            async with self.sem:
-                positions = await follower.mexc.get_open_positions()
+            orders = await mexc.get_order_history(symbol, limit=5)
+            # Ищем последний открывающий ордер
+            open_orders = [order for order in orders if order.get('side') in [1, 3] and order.get('state') == 3]
+
+            entry_price = "N/A"
+            margin = "N/A"
+
+            if open_orders:
+                latest_open = open_orders[0]
+                entry_price = latest_open.get('dealAvgPrice', latest_open.get('dealAvgPriceStr', 'N/A'))
+                margin = latest_open.get('orderMargin', 'N/A')
+
+            slave_data.append({
+                'leverage': acc_leverage,
+                'vol': acc_vol,
+                'entry_price': entry_price,
+                'margin': margin
+            })
         except Exception as e:
-            logger.exception(
-                "Ошибка получения позиций аккаунта %s при закрытии: %s",
-                follower.uid,
-                e,
-            )
-            return {"status": "error", "uid": follower.uid, "error": str(e)}
+            print(f"⚠️ Ошибка получения данных аккаунта: {e}")
+            slave_data.append({
+                'leverage': acc_leverage,
+                'vol': acc_vol,
+                'entry_price': 'N/A',
+                'margin': 'N/A'
+            })
 
-        to_close: List[dict] = []
-        for pos in positions:
-            try:
-                if (
-                    pos.get("symbol") == sync_info.symbol
-                    and int(pos.get("side")) == sync_info.side
-                    and int(pos.get("leverage")) == sync_info.leverage
-                ):
-                    to_close.append(pos)
-            except Exception:
-                continue
+    # Формируем сообщение для Telegram с реальной маржой
+    side_text = "LONG" if side == 1 else "SHORT"
+    message = f"🚀 Открытие позиции {symbol} side={side_text} x{leverage}\n\n"
+    message += f"<b>Главный аккаунт:</b>\n"
+    message += f"  Маржа: ${main_margin}\n" if main_margin != "N/A" else f"  Маржа: расчет недоступен\n"
+    message += f"  Вход: {main_entry_price}\n\n"
+    message += f"<b>Ведомые аккаунты:</b>\n"
 
-        if not to_close:
-            return {"status": "no_position", "uid": follower.uid}
+    for i, acc_data in enumerate(slave_data, 1):
+        margin = acc_data['margin']
+        entry_price = acc_data['entry_price']
 
-        results: List[dict] = []
+        if margin != "N/A" and margin:
+            message += f"{i}) маржа=${float(margin):.2f}, вход={entry_price}\n"
+        else:
+            message += f"{i}) маржа=расчет недоступен, вход={entry_price}\n"
 
-        for pos in to_close:
-            position_id = str(pos["positionId"])
-            vol = float(pos["vol"])
+    await send_telegram_message(message)
+    return results
 
-            try:
-                async with self.sem:
-                    result = await follower.mexc.close_position(
-                        sync_info.symbol,
-                        position_id,
-                        sync_info.leverage,
-                        vol,
-                        close_side,
-                    )
-            except Exception as e:
-                logger.exception(
-                    "Ошибка закрытия позиции %s на аккаунте %s: %s",
-                    position_id,
-                    follower.uid,
-                    e,
-                )
-                results.append(
-                    {
-                        "position_id": position_id,
-                        "status": "error",
-                        "error": str(e),
-                        "vol": vol,
-                    }
-                )
-                continue
 
-            # === Достаём ответ сразу (чтобы логгер всегда видел container) ===
-            try:
-                raw_data = result.json() if hasattr(result, "json") else result
-                if isinstance(raw_data, str):
-                    raw_data = json.loads(raw_data)
-            except Exception as e:
-                logger.warning("Не удалось распарсить ответ закрытия для %s: %s", follower.uid, e)
-                raw_data = {}
+async def open_limit_orders(mexcs: list[Mexc], symbol, side, leverage, price, vol, open_type):
+    """Открыть лимитные ордера на всех аккаунтах"""
+    tasks = []
+    print(
+        f"📝 Открываем лимитный ордер {symbol} ({side}) для всех аккаунтов | price={price} | базовый vol={vol} | базовый leverage={leverage} | openType={open_type}")
 
-            container = raw_data.get("data") or raw_data.get("result") or raw_data if isinstance(raw_data, dict) else {}
-            logger.info("RAW CLOSE RESPONSE %s: %s", follower.uid, container)
+    for mexc in mexcs:
+        # Генерируем случайный leverage для каждого аккаунта
+        random_leverage = random.randint(
+            LEVERAGE_RANDOM_MIN, LEVERAGE_RANDOM_MAX)
 
-            # Ждём, пока позиция попадёт в историю (1.5–3 сек обычно хватает)
-            await asyncio.sleep(2)
+        # Генерируем случайное изменение vol в процентах
+        vol_change_percent = random.randint(VOL_RANDOM_MIN, VOL_RANDOM_MAX)
+        random_vol = int(vol * (1 + vol_change_percent / 100))
 
-            # Получаем историю за последний час
-            now_ms = int(time.time() * 1000)
-            start_time = now_ms - 3600_000  # 1 час назад
-            end_time = now_ms
+        # Убеждаемся что vol >= 1
+        random_vol = max(1, random_vol)
 
-            exit_price = None
-            pnl = None
+        print(
+            f"  📊 Аккаунт: leverage={random_leverage}, vol={random_vol} ({vol_change_percent:+d}%)")
 
-            try:
-                history = await follower.mexc.get_history_positions(
-                    symbol=sync_info.symbol,
-                    position_type=position_type,
-                    start_time=start_time,
-                    end_time=end_time,
-                    page_size=50,
-                )
+        tasks.append(mexc.open_position_limit(
+            symbol, side, random_leverage, price, random_vol, open_type))
 
-                # Ищем нужную закрытую позицию
-                for h in history:
-                    if str(h.get("positionId")) == position_id and h.get("state") == 3:
-                        exit_price = h.get("closeAvgPrice")
-                        pnl = h.get("realised") or h.get("closeProfitLoss")
-                        break
-                else:
-                    # Если по ID не нашли — ищем по совпадению vol + symbol + side
-                    for h in history:
-                        if (h.get("symbol") == sync_info.symbol and
-                            h.get("side") == sync_info.side and
-                            float(h.get("vol") or 0) == vol and
-                            h.get("state") == 3):
-                            exit_price = h.get("closeAvgPrice")
-                            pnl = h.get("realised") or h.get("closeProfitLoss")
-                            break
+    results = await asyncio.gather(*tasks)
+    return results
 
-            except Exception as e:
-                logger.warning("Ошибка получения истории позиций для %s: %s", follower.uid, e)
 
-            # Если всё ещё нет — пробуем взять из ответа на ордер (редко, но бывает)
-            if exit_price is None:
-                exit_price = _extract_first_float(
-                    container,
-                    ["avgExitPrice", "exitPrice", "closeAvgPrice", "price", "closePrice"],
-                )
-            if pnl is None:
-                pnl = _extract_first_float(
-                    container,
-                    ["realised", "realizedPnl", "pnl", "closeProfitLoss", "profit"],
-                )
+async def change_limit_orders(mexcs_orders: list, price: str, vol: int):
+    """Изменить лимитные ордера на всех аккаунтах. Возвращает новые order_id"""
+    tasks = []
+    print(f"✏️ Изменяем лимитные ордера | price={price} | базовый vol={vol}")
 
-            results.append(
-                {
-                    "position_id": position_id,
-                    "status": "ok",
-                    "exit_price": exit_price,
-                    "pnl": pnl,
-                    "vol": vol,
-                }
-            )
+    for mexc, order_id in mexcs_orders:
+        # Генерируем случайное изменение vol в процентах
+        vol_change_percent = random.randint(VOL_RANDOM_MIN, VOL_RANDOM_MAX)
+        random_vol = int(vol * (1 + vol_change_percent / 100))
 
-        return {"status": "ok", "uid": follower.uid, "positions": results}
+        # Убеждаемся что vol >= 1
+        random_vol = max(1, random_vol)
 
-    # --- Новые позиции на главном ---
+        print(
+            f"  📊 Изменяем ордер {order_id}: vol={random_vol} ({vol_change_percent:+d}%)")
 
-    async def _handle_new_positions(self, positions: List[dict]) -> None:
-        for position in positions:
-            position_id = str(position["positionId"])
-            symbol = position["symbol"]
-            side = int(position["side"])
-            leverage = int(position["leverage"])
-            vol = float(position["vol"])
-            stop_loss_price = position.get("stopLossPrice")
-            if stop_loss_price is not None:
-                stop_loss_price = float(stop_loss_price)
+        tasks.append(mexc.change_limit_order(order_id, price, random_vol))
 
-            main_entry_price = _extract_first_float(
-                position,
-                [
-                    "entryPrice",
-                    "avgPrice",
-                    "price",
-                    "openPrice",
-                    "avgEntryPrice",
-                    "avgOpenPrice",
-                ],
-            )
+    results = await asyncio.gather(*tasks)
 
-            logger.info(
-                "Новая позиция на главном аккаунте: %s id=%s side=%s lev=%s vol=%s",
-                symbol,
-                position_id,
-                side,
-                leverage,
-                vol,
-            )
-
-            sync_info = PositionSyncInfo(
-                symbol=symbol,
-                side=side,
-                leverage=leverage,
-                main_entry_price=main_entry_price,
-                main_vol=vol,
-            )
-            self.opened_positions[position_id] = sync_info
-
-            open_tasks: List[asyncio.Task] = []
-            for follower in self.followers:
-                follower_vol = vol * follower.size_multiplier
-                open_tasks.append(
-                    self._open_on_follower(
-                        follower,
-                        symbol,
-                        side,
-                        leverage,
-                        stop_loss_price,
-                        follower_vol,
-                        main_entry_price,
-                        sync_info,
-                    )
-                )
-
-            if not open_tasks:
-                continue
-
-            results = await asyncio.gather(*open_tasks, return_exceptions=False)
-
-            res_by_uid: Dict[str, dict] = {}
-            for res in results:
-                if isinstance(res, dict) and "uid" in res:
-                    res_by_uid[res["uid"]] = res
-
-            # --- Сообщение об открытии ---
-            lines: List[str] = [
-                f"🚀 <b>Открытие позиции</b> {symbol} side={side} x{leverage}",
-                "",
-            ]
-
-            # Главный
-            main_entry_display = (
-                str(main_entry_price) if main_entry_price is not None else "н/д"
-            )
-            lines.append("<b>Главный аккаунт</b>:")
-            lines.append(f"  Объём: {vol}")
-            lines.append(f"  Вход: {main_entry_display}")
-
-            # Ведомые
-            lines.append("")
-            lines.append("<b>Ведомые аккаунты:</b>")
-
-            for idx, follower in enumerate(self.followers, start=1):
-                uid = follower.uid
-                state = sync_info.follower_positions.get(uid)
-                res = res_by_uid.get(uid)
-
-                if res and res.get("status") == "error":
-                    lines.append(f"{idx}) ❌ ошибка открытия ({res.get('error')})")
-                    continue
-
-                if not state:
-                    lines.append(f"{idx}) нет данных по позиции")
-                    continue
-
-                entry = state.entry_price
-                f_vol = state.requested_vol
-
-                entry_display = str(entry) if entry is not None else "н/д"
-                line = f"{idx}) объём={f_vol}, вход={entry_display}"
-                lines.append(line)
-
-            msg = "\n".join(lines)
-            await self._send_telegram_message(msg)
-
-    # --- Закрытые позиции на главном ---
-
-    # --- Вспомогательная функция для расчёта маржи ---
-    def _calc_margin(self, vol: float, entry_price: float, leverage: int) -> str:
-        """
-        На MEXC для линейных фьючерсов (USDT-margined):
-        Маржа = vol × entry_price / leverage
-        vol — количество контрактов (например, для BTC_USDT 1 vol ≈ 0.0001 BTC)
-        """
-        if not entry_price or not leverage or leverage <= 0:
-            return "—"
+    # Парсим новые orderId из ответов
+    new_orders = []
+    for (mexc, old_order_id), result in zip(mexcs_orders, results):
         try:
-            margin = vol * entry_price / leverage
-            margin/=10
-            return f"<b>{margin:.4f}</b>"
-        except:
-            return "—"
-
-    # === ЗАМЕНА МЕТОДА _handle_new_positions ===
-    async def _handle_new_positions(self, positions: List[dict]) -> None:
-        for position in positions:
-            position_id = str(position["positionId"])
-            symbol = position["symbol"]
-            side = int(position["side"])
-            leverage = int(position["leverage"])
-            vol = float(position["vol"])
-            stop_loss_price = position.get("stopLossPrice")
-            if stop_loss_price is not None:
-                stop_loss_price = float(stop_loss_price)
-
-            main_entry_price = _extract_first_float(
-                position,
-                [
-                    "entryPrice",
-                    "avgPrice",
-                    "price",
-                    "openPrice",
-                    "avgEntryPrice",
-                    "avgOpenPrice",
-                ],
-            )
-
-            logger.info(
-                "Новая позиция на главном: %s id=%s side=%s lev=%s vol=%s",
-                symbol, position_id, side, leverage, vol,
-            )
-
-            sync_info = PositionSyncInfo(
-                symbol=symbol,
-                side=side,
-                leverage=leverage,
-                main_entry_price=main_entry_price,
-                main_vol=vol,
-            )
-            self.opened_positions[position_id] = sync_info
-
-            open_tasks = []
-            for follower in self.followers:
-                follower_vol = vol * follower.size_multiplier
-                open_tasks.append(
-                    self._open_on_follower(
-                        follower,
-                        symbol,
-                        side,
-                        leverage,
-                        stop_loss_price,
-                        follower_vol,
-                        main_entry_price,
-                        sync_info,
-                    )
-                )
-
-            if not open_tasks:
-                continue
-
-            results = await asyncio.gather(*open_tasks)
-            res_by_uid = {r.get("uid"): r for r in results if isinstance(r, dict) and "uid" in r}
-
-            # === КРАСИВОЕ СООБЩЕНИЕ ОБ ОТКРЫТИИ ===
-            lines = [
-                f"Открытие позиции <b>{symbol}</b> ×<b>{leverage}</b> "
-                f"{'LONG' if side == 1 else 'SHORT'}",
-                "",
-            ]
-
-            # Главный аккаунт
-            main_margin = self._calc_margin(vol, main_entry_price or 0, leverage)
-            entry_display = f"<b>{main_entry_price:.4f}</b>" if main_entry_price else "<b>—</b>"
-
-            lines.append("<b>Главный аккаунт:</b>")
-            lines.append(f"   Маржа: {main_margin} USDT")
-            lines.append(f"   Цена входа: {entry_display}")
-
-            lines.append("")
-            lines.append("<b>Ведомые аккаунты:</b>")
-
-            for idx, follower in enumerate(self.followers, start=1):
-                uid = follower.uid
-                state = sync_info.follower_positions.get(uid)
-                res = res_by_uid.get(uid)
-
-                if res and res.get("status") == "error":
-                    lines.append(f"{idx}) Ошибка открытия: {res.get('error')}")
-                    continue
-
-                if not state or state.requested_vol is None:
-                    lines.append(f"{idx}) Нет данных")
-                    continue
-
-                f_vol = state.requested_vol
-                f_entry = state.entry_price
-                f_margin = self._calc_margin(f_vol, f_entry or (main_entry_price or 0), leverage)
-                f_entry_display = f"<b>{f_entry:.4f}</b>" if f_entry else "<b>—</b>"
-
-                lines.append(f"{idx}) Маржа <b>{f_margin}</b> USDT | вход {f_entry_display}")
-
-            msg = "\n".join(lines)
-            await self._send_telegram_message(msg)
-
-    # === ЗАМЕНА МЕТОДА _handle_closed_positions ===
-    async def _handle_closed_positions(self, closed_ids: set) -> None:
-        if not closed_ids:
-            return
-
-        index_by_uid = {f.uid: i for i, f in enumerate(self.followers, start=1)}
-
-        for closed_pos_id in closed_ids:
-            sync_info = self.opened_positions.get(closed_pos_id)
-            if not sync_info:
-                continue
-
-            logger.info("Закрываем позицию %s (%s) на ведомых", closed_pos_id, sync_info.symbol)
-
-            # Данные главного аккаунта
-            main_exit_price = None
-            main_pnl = None
-            position_type = 1 if sync_info.side == 1 else 2
-
-            await asyncio.sleep(2)
-
-            now_ms = int(time.time() * 1000)
-            start_time = now_ms - 3600_000
-            end_time = now_ms
-
-            try:
-                history = await self.main.mexc.get_history_positions(
-                    symbol=sync_info.symbol,
-                    position_type=position_type,
-                    start_time=start_time,
-                    end_time=end_time,
-                    page_size=50,
-                )
-                for h in history:
-                    if str(h.get("positionId")) == closed_pos_id and h.get("state") == 3:
-                        main_exit_price = _extract_first_float(h, ["closeAvgPrice", "avgClosePrice", "exitPrice"])
-                        main_pnl = _extract_first_float(h, ["realised", "closeProfitLoss", "pnl", "profit"])
-                        break
-            except Exception as e:
-                logger.warning("Ошибка получения истории главного: %s", e)
-
-            main_margin = self._calc_margin(sync_info.main_vol, sync_info.main_entry_price or 0, sync_info.leverage)
-            exit_display = f"<b>{main_exit_price:.4f}</b>" if main_exit_price else "<b>—</b>"
-            pnl_display = f"<b>{main_pnl:+.4f}</b>" if main_pnl is not None else "<b>—</b>"
-
-            close_tasks = [self._close_on_follower(f, sync_info) for f in self.followers]
-            results = await asyncio.gather(*close_tasks)
-
-            # === СООБЩЕНИЕ О ЗАКРЫТИИ ===
-            lines = [
-                f"Закрытие позиции <b>{sync_info.symbol}</b> ×<b>{sync_info.leverage}</b> "
-                f"{'LONG' if sync_info.side == 1 else 'SHORT'}",
-                "",
-                "<b>Главный аккаунт:</b>",
-                f"   Маржа: {main_margin} USDT",
-                f"   Выход: {exit_display}",
-                f"   PnL: {pnl_display} USDT",
-                "",
-                "<b>Ведомые аккаунты:</b>",
-            ]
-
-            for res in results:
-                if not isinstance(res, dict):
-                    continue
-                uid = res.get("uid", "?")
-                idx = index_by_uid.get(uid, "?")
-
-                if res.get("status") != "ok" or not res.get("positions"):
-                    lines.append(f"{idx}) Нет позиции / ошибка")
-                    continue
-
-                for p in res["positions"]:
-                    if p.get("status") != "ok":
-                        lines.append(f"{idx}) Ошибка закрытия")
-                        continue
-
-                    vol = p.get("vol", 0)
-                    entry_price = sync_info.main_entry_price or 0
-                    margin = self._calc_margin(vol, entry_price, sync_info.leverage)
-                    exit_p = p.get("exit_price")
-                    pnl = p.get("pnl")
-
-                    exit_str = f"<b>{exit_p:.4f}</b>" if exit_p else "<b>—</b>"
-                    pnl_str = f"<b>{pnl:+.4f}</b>" if pnl is not None else "<b>—</b>"
-
-                    lines.append(f"{idx}) Маржа {margin} USDT | выход {exit_str} | PnL {pnl_str}")
-
-            msg = "\n".join(lines)
-            await self._send_telegram_message(msg)
-
-            self.opened_positions.pop(closed_pos_id, None)
-
-    # --- Один шаг цикла ---
-
-    async def sync_once(self) -> None:
-        try:
-            positions = await self.main.mexc.get_open_positions()
+            r_json = result.json()
+            if r_json.get("success"):
+                new_order_id = r_json.get("data")
+                new_orders.append((mexc, new_order_id))
+                print(f"  ✅ Ордер изменён: {old_order_id} → {new_order_id}")
+            else:
+                print(f"  ❌ Ошибка изменения ордера {old_order_id}: {r_json}")
         except Exception as e:
-            logger.exception("Ошибка получения позиций главного аккаунта: %s", e)
-            return
+            print(f"  ❌ Ошибка парсинга ответа: {e}")
 
-        current_ids = {str(pos["positionId"]) for pos in positions}
-        known_ids = set(self.opened_positions.keys())
+    return new_orders
 
-        closed_ids = known_ids - current_ids
+
+async def cancel_limit_orders(mexcs_orders: list):
+    """Отменить лимитные ордера на всех аккаунтах"""
+    tasks = []
+    print(f"🚫 Отменяем лимитные ордера на {len(mexcs_orders)} аккаунтах")
+
+    for mexc, order_id in mexcs_orders:
+        tasks.append(mexc.cancel_order([order_id]))
+
+    results = await asyncio.gather(*tasks)
+    return results
+
+
+# Обновленная функция close_positions с использованием истории ордеров
+async def close_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, vol, open_type):
+    close_side = 4 if side == 1 else 2
+
+    all_positions = await asyncio.gather(*[mexc.get_open_positions() for mexc in mexcs])
+
+    close_tasks = []
+    account_info = []
+
+    # Добавляем главный аккаунт в обработку
+    main_positions = await main_mexc.get_open_positions()
+    for position in main_positions:
+        if (position['symbol'] == symbol and
+                position['side'] == side):
+            position_id = position['positionId']
+            position_vol = position['vol']
+            position_leverage = position['leverage']
+            position_open_type = position['openType']
+
+            print(
+                f"  🔒 Закрываем позицию {position_id} (leverage={position_leverage}, vol={position_vol}) на ГЛАВНОМ аккаунте")
+
+            close_tasks.append(main_mexc.close_position(
+                symbol, position_id, position_leverage, position_vol, close_side, position_open_type))
+
+            account_info.append({
+                'mexc': main_mexc,
+                'symbol': symbol,
+                'side': side,
+                'is_main': True
+            })
+
+    for mexc, positions in zip(mexcs, all_positions):
+        for position in positions:
+            if (position['symbol'] == symbol and
+                    position['side'] == side):
+                position_id = position['positionId']
+                position_vol = position['vol']
+                position_leverage = position['leverage']
+                position_open_type = position['openType']
+
+                print(
+                    f"  🔒 Закрываем позицию {position_id} (leverage={position_leverage}, vol={position_vol}) на ведомом аккаунте")
+
+                close_tasks.append(mexc.close_position(
+                    symbol, position_id, position_leverage, position_vol, close_side, position_open_type))
+
+                account_info.append({
+                    'mexc': mexc,
+                    'symbol': symbol,
+                    'side': side,
+                    'is_main': False
+                })
+
+    if close_tasks:
+        # Закрываем все позиции
+        results = await asyncio.gather(*close_tasks)
+
+        # Ждем немного для обновления данных
+        await asyncio.sleep(3)
+
+        # Получаем данные о марже и PNL из истории ордеров
+        account_results = []
+
+        for acc_info in account_info:
+            mexc = acc_info['mexc']
+            symbol = acc_info['symbol']
+            side = acc_info['side']
+            is_main = acc_info['is_main']
+
+            try:
+                # Получаем историю ордеров
+                orders = await mexc.get_order_history(symbol, limit=10)
+
+                # Ищем последний закрывающий ордер
+                close_orders = [order for order in orders if order.get('side') in [2, 4] and order.get('state') == 3]
+
+                # Ищем соответствующий открывающий ордер
+                open_orders = [order for order in orders if order.get('side') in [1, 3] and order.get('state') == 3]
+
+                margin = "N/A"
+                pnl = "N/A"
+                entry_price = "N/A"
+                exit_price = "N/A"
+
+                if close_orders and open_orders:
+                    latest_close = close_orders[0]
+                    latest_open = open_orders[0]
+
+                    margin = latest_open.get('orderMargin', 'N/A')
+                    pnl = latest_close.get('profit', 'N/A')
+                    entry_price = latest_open.get('dealAvgPrice', latest_open.get('dealAvgPriceStr', 'N/A'))
+                    exit_price = latest_close.get('dealAvgPrice', latest_close.get('dealAvgPriceStr', 'N/A'))
+
+                account_results.append({
+                    'is_main': is_main,
+                    'margin': margin,
+                    'pnl': pnl,
+                    'entry_price': entry_price,
+                    'exit_price': exit_price
+                })
+
+            except Exception as e:
+                print(f"  ⚠️ Ошибка получения данных закрытия: {e}")
+                account_results.append({
+                    'is_main': is_main,
+                    'margin': 'N/A',
+                    'pnl': 'N/A',
+                    'entry_price': 'N/A',
+                    'exit_price': 'N/A'
+                })
+
+        # Формируем сообщение для Telegram с маржой и PNL
+        side_text = "LONG" if side == 1 else "SHORT"
+        message = f"✅ Закрытие позиции {symbol} side={side_text} x{leverage}\n\n"
+
+        # Данные главного аккаунта
+        main_data = next((acc for acc in account_results if acc['is_main']), None)
+        if main_data:
+            margin = main_data['margin']
+            pnl = main_data['pnl']
+            exit_price = main_data['exit_price']
+
+            message += f"<b>Главный аккаунт:</b>\n"
+            if margin != "N/A" and margin and pnl != "N/A" and pnl:
+                pnl_float = float(pnl)
+                pnl_sign = "+" if pnl_float >= 0 else ""
+                if pnl_float >= 10.0:
+                    message += f"  маржа=${float(margin):.2f},выход={exit_price}, PNL=☠️<code>{pnl_sign}{pnl_float:.4f}</code>☠️ \n"
+                elif pnl_float <= -5.0:
+                    message += f"  маржа=${float(margin):.2f},выход={exit_price}, PNL=🤡<code>{pnl_sign}{pnl_float:.4f}</code>🤡 \n"
+                elif pnl_float >= 0.0:
+                    message += f"  маржа=${float(margin):.2f},выход={exit_price}, PNL=🟢<code>{pnl_sign}{pnl_float:.4f}</code>🟢 \n"
+                elif pnl_float < 0.0:
+                    message += f"  маржа=${float(margin):.2f},выход={exit_price}, PNL=🔴<code>{pnl_sign}{pnl_float:.4f}</code>🔴 \n"
+
+            else:
+                message += f"  маржа=расчет недоступен, PNL=расчет недоступен, выход={exit_price}\n"
+
+        message += f"\n<b>Ведомые аккаунты:</b>\n"
+
+        # Данные ведомых аккаунтов
+        slave_count = 1
+        for acc_data in account_results:
+            if not acc_data['is_main']:  # Только ведомые аккаунты
+                margin = acc_data['margin']
+                pnl = acc_data['pnl']
+                exit_price = acc_data['exit_price']
+
+                if margin != "N/A" and margin and pnl != "N/A" and pnl:
+                    pnl_float = float(pnl)
+                    pnl_sign = "+" if pnl_float >= 0 else ""
+                    if pnl_float >= 10.0:
+                        message += f"{slave_count}) маржа=${float(margin):.2f},выход={exit_price}, PNL=☠️<code>{pnl_sign}{pnl_float:.4f}</code>☠️ \n"
+                    elif pnl_float <= -5.0:
+                        message += f"{slave_count}) маржа=${float(margin):.2f},выход={exit_price}, PNL=🤡<code>{pnl_sign}{pnl_float:.4f}</code>🤡 \n"
+                    else:
+                        message += f"{slave_count}) маржа=${float(margin):.2f},выход={exit_price}, PNL=<code>{pnl_sign}{pnl_float:.4f}</code> \n"
+                else:
+                    message += f"{slave_count}) маржа=расчет недоступен, PNL=расчет недоступен, выход={exit_price}\n"
+                slave_count += 1
+
+        await send_telegram_message(message)
+        return results
+    return []
+
+
+async def main():
+    print("🟢 Бот запущен пользователем.")
+    with open("./accounts/main.txt", "r") as file:
+        for line in file:
+            parts = line.strip().split("|")
+            uid = parts[0]
+            proxy = parts[1] if len(parts) > 1 else None
+            main_mexc = Mexc(uid, proxy)
+
+    accounts = load_accounts()
+    accounts_mexc = []
+    for account in accounts:
+        accounts_mexc.append(Mexc(account[0], account[1]))
+    slave_count = len(accounts_mexc)
+    print(f"\nУспешно загружено {slave_count} ведомых аккаунтов\n")
+    opened_positions = {}
+    opened_orders = {}  # {orderId: {symbol, price, vol, leverage, side}}
+    synced_orders = {}  # {main_orderId: [(mexc, acc_orderId), ...]}
+    limit_positions = set()  # Позиции которые появились от исполнения лимитных ордеров
+
+    while True:
+        positions = await main_mexc.get_open_positions()
+        # print(positions)
+
+        current_position_ids = set(pos['positionId'] for pos in positions)
+
+        closed_position_ids = [pos_id for pos_id in opened_positions.keys()
+                               if pos_id not in current_position_ids]
+
+        if closed_position_ids:
+            close_tasks = []
+            for closed_pos_id in closed_position_ids:
+                pos_info = opened_positions[closed_pos_id]
+                print(
+                    f"❌ Позиция {closed_pos_id} закрыта на главном аккаунте, закрываем на всех остальных...")
+
+                close_tasks.append(close_positions(
+                    main_mexc,  # Добавляем главный аккаунт
+                    accounts_mexc,
+                    pos_info['symbol'],
+                    pos_info['side'],
+                    pos_info['leverage'],
+                    pos_info['vol'],
+                    pos_info['openType']
+                ))
+
+            await asyncio.gather(*close_tasks)
+
+            for closed_pos_id in closed_position_ids:
+                del opened_positions[closed_pos_id]
+                print(f"✅ Позиция {closed_pos_id} закрыта на всех аккаунтах")
+
         new_positions = [
-            pos for pos in positions if str(pos["positionId"]) not in known_ids
-        ]
+            pos for pos in positions if pos['positionId'] not in opened_positions]
 
-        if closed_ids:
-            await self._handle_closed_positions(closed_ids)
         if new_positions:
-            await self._handle_new_positions(new_positions)
+            open_tasks = []
+            for position in new_positions:
+                positionId = position['positionId']
+                symbol = position['symbol']
+                side = position['side']
+                vol = position['vol']
+                leverage = position['leverage']
+                stopLossPrice = position['stopLossPrice']
+                openType = position['openType']
 
-    # --- Основной цикл ---
+                # Проверяем - не появилась ли эта позиция от исполнения лимитного ордера
+                position_key = (symbol, side)
+                if position_key in limit_positions:
+                    print(
+                        f"⏭️ Позиция {positionId} ({symbol}, side={side}) появилась от лимитного ордера - пропускаем")
+                    limit_positions.remove(position_key)
 
-    async def run(self) -> None:
-        logger.info(
-            "Старт копировщика. Задержка между проверками: %s сек",
-            DELAY_BETWEEN_CHECK_POSITIONS,
-        )
-        while True:
-            await self.sync_once()
-            await asyncio.sleep(DELAY_BETWEEN_CHECK_POSITIONS)
+                    opened_positions[positionId] = {
+                        'symbol': symbol,
+                        'side': side,
+                        'leverage': leverage,
+                        'vol': vol,
+                        'openType': openType
+                    }
+                    continue
 
+                print(
+                    f"🚀 Открываем позицию {positionId} ({symbol}, side={side}) для всех аккаунтов")
 
-# === Точка входа ===
+                open_tasks.append(open_positions(
+                    main_mexc,
+                    accounts_mexc, symbol, side, leverage, stopLossPrice, vol, openType))
 
-async def main() -> None:
-    main_acc = load_main_account()
-    followers = load_follower_accounts()
-    copier = TradeCopier(main_acc, followers)
-    await copier.run()
+                opened_positions[positionId] = {
+                    'symbol': symbol,
+                    'side': side,
+                    'leverage': leverage,
+                    'vol': vol,
+                    'openType': openType
+                }
+
+            if open_tasks:
+                all_results = await asyncio.gather(*open_tasks)
+
+                for results in all_results:
+                    for result in results:
+                        print(result.json())
+
+        # ========== ОБРАБОТКА ЛИМИТНЫХ ОРДЕРОВ ==========
+        orders = await main_mexc.get_open_orders()
+        current_order_ids = set(order['orderId'] for order in orders)
+
+        # 1. ОБРАБОТКА УДАЛЁННЫХ/ИСПОЛНЕННЫХ ОРДЕРОВ
+        removed_order_ids = [order_id for order_id in opened_orders.keys()
+                             if order_id not in current_order_ids]
+
+        if removed_order_ids:
+            for removed_order_id in removed_order_ids:
+                order_info = opened_orders[removed_order_id]
+                symbol = order_info['symbol']
+                side = order_info['side']
+                leverage = order_info['leverage']
+
+                # Проверяем - появилась ли позиция (исполнился ордер)
+                position_exists = any(
+                    pos['symbol'] == symbol and
+                    pos['side'] == side
+                    for pos in positions
+                )
+
+                if position_exists:
+                    print(
+                        f"✅ Лимитный ордер {removed_order_id} исполнился на главном аке ({symbol}, side={side})")
+                    # Помечаем что позиция появилась от лимитки - не открывать по маркету
+                    limit_positions.add((symbol, side))
+                else:
+                    # Ордер отменён пользователем - отменяем на всех аках
+                    print(
+                        f"🚫 Лимитный ордер {removed_order_id} отменён на главном аке - отменяем на всех")
+                    if removed_order_id in synced_orders:
+                        await cancel_limit_orders(synced_orders[removed_order_id])
+                        del synced_orders[removed_order_id]
+
+                del opened_orders[removed_order_id]
+
+        # 2. ОБРАБОТКА НОВЫХ ОРДЕРОВ
+        new_orders = [
+            order for order in orders if order['orderId'] not in opened_orders]
+
+        if new_orders:
+            for order in new_orders:
+                order_id = order['orderId']
+                symbol = order['symbol']
+                side = order['side']
+                vol = order['vol']
+                leverage = order['leverage']
+                price = str(order['price'])
+                openType = order['openType']
+
+                print(
+                    f"📝 Новый лимитный ордер {order_id} ({symbol}, side={side}, price={price}, openType={openType})")
+
+                # Открываем на всех аках
+                results = await open_limit_orders(
+                    accounts_mexc, symbol, side, leverage, price, vol, openType)
+
+                # Сохраняем связь
+                acc_orders = []
+                for mexc, result in zip(accounts_mexc, results):
+                    try:
+                        r_json = result.json()
+                        if r_json.get("success"):
+                            acc_order_id = r_json['data']['orderId']
+                            acc_orders.append((mexc, acc_order_id))
+                            print(f"  ✅ Ордер создан: {acc_order_id}")
+                        else:
+                            print(f"  ❌ Ошибка создания ордера: {r_json}")
+                    except Exception as e:
+                        print(f"  ❌ Ошибка парсинга: {e}")
+
+                synced_orders[order_id] = acc_orders
+                opened_orders[order_id] = {
+                    'symbol': symbol,
+                    'price': price,
+                    'vol': vol,
+                    'leverage': leverage,
+                    'side': side,
+                    'openType': openType
+                }
+
+        # 3. ОБРАБОТКА ИЗМЕНЁННЫХ ОРДЕРОВ
+        # Ищем по (symbol, leverage, side) ордера с изменившимся orderId или параметрами
+        for order in orders:
+            order_id = order['orderId']
+            if order_id in opened_orders:
+                # Проверяем изменились ли параметры
+                old_order = opened_orders[order_id]
+                new_price = str(order['price'])
+                new_vol = order['vol']
+
+                if old_order['price'] != new_price or old_order['vol'] != new_vol:
+                    print(
+                        f"✏️ Ордер {order_id} изменён (price: {old_order['price']}→{new_price}, vol: {old_order['vol']}→{new_vol})")
+
+                    # Изменяем на всех аках
+                    if order_id in synced_orders:
+                        new_acc_orders = await change_limit_orders(
+                            synced_orders[order_id], new_price, new_vol)
+                        synced_orders[order_id] = new_acc_orders
+
+                    # Обновляем информацию
+                    opened_orders[order_id]['price'] = new_price
+                    opened_orders[order_id]['vol'] = new_vol
+
+        await asyncio.sleep(DELAY_BETWEEN_CHECK_POSITIONS)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Остановлено пользователем (Ctrl+C)")
+        print("\n🔴 Бот остановлен пользователем.")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
