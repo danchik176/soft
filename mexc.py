@@ -51,13 +51,13 @@ class Mexc:
         sign = self.md5(date_now + s + g)
         return {'time': date_now, 'sign': sign}
 
-    async def get_order_history(self, symbol: str = None, limit: int = 10):
-        """Получение истории ордеров"""
+    async def get_order_history(self, symbol: str = None, limit: int = 50):
+        """Получение истории ордеров с улучшенной фильтрацией"""
         url = "https://www.mexc.com/api/platform/futures/api/v1/private/order/list/history_orders"
         params = {
             'page_num': 1,
             'page_size': limit,
-            'state': 3  # Выполненные ордера (state=3)
+            'state': 3  # Выполненные ордера
         }
         if symbol:
             params['symbol'] = symbol
@@ -69,7 +69,13 @@ class Mexc:
             print(f"❌ Ошибка получения истории ордеров: {r_json.get('message', 'Unknown error')}")
             return []
 
-        return r_json.get("data", [])
+        orders = r_json.get("data", [])
+
+        # Сортируем ордера по времени создания (новые сначала)
+        orders.sort(key=lambda x: x.get('createTime', 0), reverse=True)
+
+        return orders
+
     async def _request_with_retry(self, method, url, max_retries=3, timeout=10, **kwargs):
         """Выполняет запрос с retry логикой и таймаутом"""
         for attempt in range(max_retries):
