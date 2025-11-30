@@ -122,10 +122,10 @@ async def open_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, s
             })
 
     # Формируем сообщение для Telegram с реальной маржой
-    side_text = "LONG" if side == 1 else "SHORT"
-    message = f"🚀 Открытие позиции {symbol} side={side_text} x{leverage}\n\n"
+    side_text = "LONG📈" if side == 1 else "SHORT📉"
+    message = f"🚀 Открытие позиции {symbol} {side_text} x{leverage}\n\n"
     message += f"<b>Главный аккаунт:</b>\n"
-    message += f"  Маржа: ${main_margin}\n" if main_margin != "N/A" else f"  Маржа: расчет недоступен\n"
+    message += f"  Маржа: {main_margin} 💲\n" if main_margin != "N/A" else f"  Маржа: расчет недоступен\n"
     message += f"  Вход: {main_entry_price}\n\n"
     message += f"<b>Ведомые аккаунты:</b>\n"
 
@@ -134,9 +134,9 @@ async def open_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, s
         entry_price = acc_data['entry_price']
 
         if margin != "N/A" and margin:
-            message += f"{i}) маржа=${float(margin):.2f}, вход={entry_price}\n"
+            message += f"{i}) маржа = {float(margin):.2f} 💲, вход = {entry_price}\n"
         else:
-            message += f"{i}) маржа=расчет недоступен, вход={entry_price}\n"
+            message += f"{i}) маржа = расчет недоступен, вход = {entry_price}\n"
 
     await send_telegram_message(message)
     return results
@@ -220,48 +220,42 @@ async def cancel_limit_orders(mexcs_orders: list):
 
 
 # Обновленная функция close_positions с использованием истории ордеров
-async def close_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, vol, open_type):
+async def close_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, vol, open_type, main_position_data=None):
     close_side = 4 if side == 1 else 2
 
-    all_positions = await asyncio.gather(*[mexc.get_open_positions() for mexc in mexcs])
+    # Включаем главный аккаунт в список всех аккаунтов
+    all_mexcs = [main_mexc] + mexcs
+    print(f"🔍 Всего аккаунтов для проверки: {len(all_mexcs)} (главный + {len(mexcs)} ведомых)")
+
+    # Получаем позиции для всех аккаунтов
+    all_positions = await asyncio.gather(*[mexc.get_open_positions() for mexc in all_mexcs])
 
     close_tasks = []
     account_info = []
 
-    # Добавляем главный аккаунт в обработку
-    main_positions = await main_mexc.get_open_positions()
-    for position in main_positions:
-        if (position['symbol'] == symbol and
-                position['side'] == side):
-            position_id = position['positionId']
-            position_vol = position['vol']
-            position_leverage = position['leverage']
-            position_open_type = position['openType']
+    print(f"🔍 Поиск позиций {symbol} side={side} для закрытия...")
 
-            print(
-                f"  🔒 Закрываем позицию {position_id} (leverage={position_leverage}, vol={position_vol}) на ГЛАВНОМ аккаунте")
+    # Обрабатываем ВЕДОМЫЕ аккаунты - ищем открытые позиции
+    for i, (mexc, positions) in enumerate(zip(all_mexcs[1:], all_positions[1:]), 1):  # Пропускаем главный
+        is_main = False
 
-            close_tasks.append(main_mexc.close_position(
-                symbol, position_id, position_leverage, position_vol, close_side, position_open_type))
+        print(f"  👤 Проверка ведомого аккаунта {i}/{len(mexcs)}")
+        print(f"    📊 Найдено позиций: {len(positions)}")
 
-            account_info.append({
-                'mexc': main_mexc,
-                'symbol': symbol,
-                'side': side,
-                'is_main': True
-            })
-
-    for mexc, positions in zip(mexcs, all_positions):
+        position_found = False
         for position in positions:
-            if (position['symbol'] == symbol and
-                    position['side'] == side):
+            print(
+                f"    🔍 Проверка позиции: {position['symbol']} side={position['side']} vs нужная: {symbol} side={side}")
+
+            if (position['symbol'] == symbol and position['side'] == side):
+                position_found = True
                 position_id = position['positionId']
                 position_vol = position['vol']
                 position_leverage = position['leverage']
                 position_open_type = position['openType']
 
-                print(
-                    f"  🔒 Закрываем позицию {position_id} (leverage={position_leverage}, vol={position_vol}) на ведомом аккаунте")
+                print(f"    ✅ Найдена позиция {position_id} на ведомом аккаунте "
+                      f"(leverage={position_leverage}, vol={position_vol})")
 
                 close_tasks.append(mexc.close_position(
                     symbol, position_id, position_leverage, position_vol, close_side, position_open_type))
@@ -270,18 +264,64 @@ async def close_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, 
                     'mexc': mexc,
                     'symbol': symbol,
                     'side': side,
-                    'is_main': False
+                    'is_main': False,
+                    'position_id': position_id
                 })
+                break
 
-    if close_tasks:
-        # Закрываем все позиции
-        results = await asyncio.gather(*close_tasks)
+        if not position_found:
+            print(f"    ❌ Позиция {symbol} ({side}) не найдена на ведомом аккаунте {i}")
 
-        # Ждем немного для обновления данных
-        await asyncio.sleep(3)
+    # ОСОБАЯ ОБРАБОТКА ГЛАВНОГО АККАУНТА
+    # Используем сохраненные данные, так как позиция уже могла быть закрыта
+    print("  👑 Обработка главного аккаунта (используем сохраненные данные)")
+    if main_position_data:
+        # Добавляем главный аккаунт в обработку, даже если позиция уже закрыта
+        account_info.append({
+            'mexc': main_mexc,
+            'symbol': symbol,
+            'side': side,
+            'is_main': True,
+            'position_id': main_position_data.get('positionId', 'unknown')
+        })
+        print(
+            f"    ✅ Главный аккаунт добавлен в обработку (позиция: {main_position_data.get('positionId', 'unknown')})")
+    else:
+        print(f"    ⚠️ Нет сохраненных данных главного аккаунта")
 
-        # Получаем данные о марже и PNL из истории ордеров
+    print(f"📊 Аккаунтов в обработке: {len(account_info)}")
+    print(f"👑 Главных аккаунтов: {len([acc for acc in account_info if acc['is_main']])}")
+    print(f"👥 Ведомых аккаунтов: {len([acc for acc in account_info if not acc['is_main']])}")
+
+    if account_info:  # Если есть аккаунты для обработки (хотя бы главный)
+        # Увеличиваем задержку для обновления данных (ведомые аккаунты закрываются)
+        if close_tasks:
+            print("🔄 Закрытие позиций на ведомых аккаунтах...")
+            results = await asyncio.gather(*close_tasks, return_exceptions=True)
+
+            # Обрабатываем результаты закрытия
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    print(f"  ❌ Ошибка при закрытии позиции на ведомом аккаунте: {result}")
+                else:
+                    try:
+                        r_json = result.json()
+                        if r_json.get("success"):
+                            print(f"  ✅ Позиция успешно закрыта на ведомом аккаунте")
+                        else:
+                            print(f"  ❌ Ошибка закрытия позиции на ведомом аккаунте: {r_json}")
+                    except Exception as e:
+                        print(f"  ❌ Ошибка парсинга ответа с ведомого аккаунта: {e}")
+
+            print("⏳ Ожидание обновления данных (7 сек)...")
+            await asyncio.sleep(7)
+        else:
+            print("⏳ Ожидание обновления данных (5 сек)...")
+            await asyncio.sleep(5)
+
+        # Получаем данные о марже и PNL из истории ордеров для ВСЕХ аккаунтов
         account_results = []
+        print("📊 Сбор данных о закрытых позициях...")
 
         for acc_info in account_info:
             mexc = acc_info['mexc']
@@ -290,14 +330,47 @@ async def close_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, 
             is_main = acc_info['is_main']
 
             try:
+                print(f"  🔍 Получение истории ордеров для {'главного' if is_main else 'ведомого'} аккаунта...")
+
                 # Получаем историю ордеров
-                orders = await mexc.get_order_history(symbol, limit=10)
+                orders = await mexc.get_order_history(symbol, limit=50)
 
-                # Ищем последний закрывающий ордер
-                close_orders = [order for order in orders if order.get('side') in [2, 4] and order.get('state') == 3]
+                if not orders:
+                    print(f"    ⚠️ История ордеров пуста для {'главного' if is_main else 'ведомого'} аккаунта")
+                    account_results.append({
+                        'is_main': is_main,
+                        'margin': 'N/A',
+                        'pnl': 'N/A',
+                        'entry_price': 'N/A',
+                        'exit_price': 'N/A'
+                    })
+                    continue
 
-                # Ищем соответствующий открывающий ордер
-                open_orders = [order for order in orders if order.get('side') in [1, 3] and order.get('state') == 3]
+                # Ищем закрывающие ордера (side 2 или 4)
+                close_orders = []
+                for order in orders:
+                    if (order.get('state') == 3 and  # Выполненный ордер
+                            order.get('side') in [2, 4] and  # Закрывающие стороны
+                            order.get('symbol') == symbol and  # Тот же символ
+                            order.get('dealVol', 0) > 0):  # Есть объем сделки
+                        close_orders.append(order)
+
+                # Ищем открывающие ордера (side 1 или 3) - БОЛЕЕ ТОЧНЫЙ ПОИСК
+                open_orders = []
+                for order in orders:
+                    if (order.get('state') == 3 and  # Выполненный ордер
+                            order.get('side') in [1, 3] and  # Открывающие стороны
+                            order.get('symbol') == symbol and  # Тот же символ
+                            order.get('dealVol', 0) > 0):  # Есть объем сделки
+                        open_orders.append(order)
+
+                print(f"    📋 Найдено открывающих ордеров: {len(open_orders)}, закрывающих: {len(close_orders)}")
+
+                print(f"    📋 Найдено открывающих ордеров: {len(open_orders)}, закрывающих: {len(close_orders)}")
+
+                # Сортируем по времени (новые сначала)
+                close_orders.sort(key=lambda x: x.get('createTime', 0), reverse=True)
+                open_orders.sort(key=lambda x: x.get('createTime', 0), reverse=True)
 
                 margin = "N/A"
                 pnl = "N/A"
@@ -305,13 +378,55 @@ async def close_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, 
                 exit_price = "N/A"
 
                 if close_orders and open_orders:
+                    # Берем самый последний закрывающий ордер
                     latest_close = close_orders[0]
-                    latest_open = open_orders[0]
-
-                    margin = latest_open.get('orderMargin', 'N/A')
+                    exit_price = latest_close.get('dealAvgPrice',
+                                                  latest_close.get('dealAvgPriceStr', 'N/A'))
                     pnl = latest_close.get('profit', 'N/A')
-                    entry_price = latest_open.get('dealAvgPrice', latest_open.get('dealAvgPriceStr', 'N/A'))
-                    exit_price = latest_close.get('dealAvgPrice', latest_close.get('dealAvgPriceStr', 'N/A'))
+                    close_time = latest_close.get('createTime', 0)
+
+                    print(f"    💰 Последний закрывающий ордер: exit_price={exit_price}, PNL={pnl}, time={close_time}")
+
+                    # Ищем соответствующий открывающий ордер по времени и объему
+                    corresponding_open = None
+                    for open_order in open_orders:
+                        open_time = open_order.get('createTime', 0)
+                        # Открывающий ордер должен быть раньше закрывающего и по тому же символу
+                        if (open_time < close_time and
+                                open_order.get('symbol') == symbol and
+                                abs(open_order.get('vol', 0) - latest_close.get('vol',
+                                                                                0)) <= 1):  # Примерно одинаковый объем
+                            corresponding_open = open_order
+                            break
+
+                    # Если не нашли по объему, берем просто последний открывающий до закрытия
+                    if not corresponding_open:
+                        for open_order in open_orders:
+                            if (open_order.get('createTime', 0) < close_time and
+                                    open_order.get('symbol') == symbol):
+                                corresponding_open = open_order
+                                break
+
+                    if corresponding_open:
+                        margin = corresponding_open.get('orderMargin', 'N/A')
+                        entry_price = corresponding_open.get('dealAvgPrice',
+                                                             corresponding_open.get('dealAvgPriceStr', 'N/A'))
+                        open_time = corresponding_open.get('createTime', 0)
+                        print(
+                            f"    📈 Найден открывающий ордер: entry_price={entry_price}, margin={margin}, time={open_time}")
+                    else:
+                        print(f"    ⚠️ Не найден соответствующий открывающий ордер для закрытия")
+                        # Используем первый открывающий ордер как fallback
+                        if open_orders:
+                            corresponding_open = open_orders[0]
+                            margin = corresponding_open.get('orderMargin', 'N/A')
+                            entry_price = corresponding_open.get('dealAvgPrice',
+                                                                 corresponding_open.get('dealAvgPriceStr', 'N/A'))
+                            print(
+                                f"    📈 Используем первый открывающий ордер: entry_price={entry_price}, margin={margin}")
+                else:
+                    print(
+                        f"    ⚠️ Недостаточно данных: close_orders={len(close_orders)}, open_orders={len(open_orders)}")
 
                 account_results.append({
                     'is_main': is_main,
@@ -322,7 +437,7 @@ async def close_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, 
                 })
 
             except Exception as e:
-                print(f"  ⚠️ Ошибка получения данных закрытия: {e}")
+                print(f"  ❌ Ошибка получения данных закрытия для {'главного' if is_main else 'ведомого'} аккаунта: {e}")
                 account_results.append({
                     'is_main': is_main,
                     'margin': 'N/A',
@@ -331,59 +446,78 @@ async def close_positions(main_mexc, mexcs: list[Mexc], symbol, side, leverage, 
                     'exit_price': 'N/A'
                 })
 
-        # Формируем сообщение для Telegram с маржой и PNL
-        side_text = "LONG" if side == 1 else "SHORT"
-        message = f"✅ Закрытие позиции {symbol} side={side_text} x{leverage}\n\n"
+        # Формируем сообщение для Telegram (остается без изменений)
+        side_text = "LONG📈" if side == 1 else "SHORT📉"
+        message = f"✅ Закрытие позиции {symbol} {side_text} x{leverage}\n\n"
 
         # Данные главного аккаунта
-        main_data = next((acc for acc in account_results if acc['is_main']), None)
-        if main_data:
+        main_data_list = [acc for acc in account_results if acc['is_main']]
+        if main_data_list:
+            main_data = main_data_list[0]
             margin = main_data['margin']
             pnl = main_data['pnl']
             exit_price = main_data['exit_price']
 
             message += f"<b>Главный аккаунт:</b>\n"
             if margin != "N/A" and margin and pnl != "N/A" and pnl:
-                pnl_float = float(pnl)
-                pnl_sign = "+" if pnl_float >= 0 else ""
-                if pnl_float >= 10.0:
-                    message += f"  маржа=${float(margin):.2f},выход={exit_price}, PNL=☠️<code>{pnl_sign}{pnl_float:.4f}</code>☠️ \n"
-                elif pnl_float <= -5.0:
-                    message += f"  маржа=${float(margin):.2f},выход={exit_price}, PNL=🤡<code>{pnl_sign}{pnl_float:.4f}</code>🤡 \n"
-                elif pnl_float >= 0.0:
-                    message += f"  маржа=${float(margin):.2f},выход={exit_price}, PNL=🟢<code>{pnl_sign}{pnl_float:.4f}</code>🟢 \n"
-                elif pnl_float < 0.0:
-                    message += f"  маржа=${float(margin):.2f},выход={exit_price}, PNL=🔴<code>{pnl_sign}{pnl_float:.4f}</code>🔴 \n"
+                try:
+                    pnl_float = float(pnl)
+                    margin_float = float(margin)
+                    pnl_sign = "+" if pnl_float >= 0 else ""
 
+                    if pnl_float >= 10.0:
+                        message += f" маржа = {margin_float:.2f}💲, выход = {exit_price} 🔚, PNL = <code>{pnl_sign}{pnl_float:.4f}</code> ☠️\n"
+                    elif pnl_float <= -5.0:
+                        message += f" маржа = {margin_float:.2f}💲, выход = {exit_price} 🔚, PNL = <code>{pnl_sign}{pnl_float:.4f}</code> 🤡\n"
+                    elif pnl_float >= 0.0:
+                        message += f" маржа = {margin_float:.2f}💲, выход = {exit_price} 🔚, PNL = <code>{pnl_sign}{pnl_float:.4f}</code> 💰\n"
+                    else:
+                        message += f"  маржа = {margin_float:.2f}💲, выход = {exit_price} 🔚, PNL = <code>{pnl_sign}{pnl_float:.4f}</code> 👹\n"
+                except (ValueError, TypeError) as e:
+                    message += f"  маржа=${margin}, выход={exit_price}, PNL=ошибка конвертации\n"
             else:
                 message += f"  маржа=расчет недоступен, PNL=расчет недоступен, выход={exit_price}\n"
+        else:
+            message += f"<b>Главный аккаунт:</b>\n"
+            message += f"  данные недоступны\n"
 
         message += f"\n<b>Ведомые аккаунты:</b>\n"
 
         # Данные ведомых аккаунтов
         slave_count = 1
         for acc_data in account_results:
-            if not acc_data['is_main']:  # Только ведомые аккаунты
+            if not acc_data['is_main']:
                 margin = acc_data['margin']
                 pnl = acc_data['pnl']
                 exit_price = acc_data['exit_price']
 
-                if margin != "N/A" and margin and pnl != "N/A" and pnl:
-                    pnl_float = float(pnl)
-                    pnl_sign = "+" if pnl_float >= 0 else ""
-                    if pnl_float >= 10.0:
-                        message += f"{slave_count}) маржа=${float(margin):.2f},выход={exit_price}, PNL=☠️<code>{pnl_sign}{pnl_float:.4f}</code>☠️ \n"
-                    elif pnl_float <= -5.0:
-                        message += f"{slave_count}) маржа=${float(margin):.2f},выход={exit_price}, PNL=🤡<code>{pnl_sign}{pnl_float:.4f}</code>🤡 \n"
-                    else:
-                        message += f"{slave_count}) маржа=${float(margin):.2f},выход={exit_price}, PNL=<code>{pnl_sign}{pnl_float:.4f}</code> \n"
+                if (margin != "N/A" and margin and margin != "" and
+                        pnl != "N/A" and pnl and pnl != "" and pnl != "0"):
+                    try:
+                        pnl_float = float(pnl)
+                        margin_float = float(margin)
+                        pnl_sign = "+" if pnl_float >= 0 else ""
+
+                        if pnl_float >= 10.0:
+                            message += f"{slave_count}) маржа = {margin_float:.2f}💲, выход = {exit_price} 🔚, PNL = <code>{pnl_sign}{pnl_float:.4f}</code> ☠️\n"
+                        elif pnl_float <= -5.0:
+                            message += f"{slave_count}) маржа = {margin_float:.2f}💲, выход = {exit_price} 🔚, PNL = <code>{pnl_sign}{pnl_float:.4f}</code> 🤡\n"
+                        elif pnl_float >= 0.0:
+                            message += f"{slave_count}) маржа = {margin_float:.2f}💲, выход = {exit_price} 🔚, PNL = <code>{pnl_sign}{pnl_float:.4f}</code> 💰\n"
+                        else:
+                            message += f"{slave_count}) маржа = {margin_float:.2f}💲, выход = {exit_price} 🔚, PNL = <code>{pnl_sign}{pnl_float:.4f}</code> 👹\n"
+                    except (ValueError, TypeError) as e:
+                        message += f"{slave_count}) маржа=${margin}, выход={exit_price}, PNL=ошибка конвертации\n"
                 else:
                     message += f"{slave_count}) маржа=расчет недоступен, PNL=расчет недоступен, выход={exit_price}\n"
                 slave_count += 1
 
+        print("📤 Отправка сообщения в Telegram...")
         await send_telegram_message(message)
-        return results
-    return []
+        return True
+
+    print("  ⚠️ Не найдено аккаунтов для обработки")
+    return False
 
 
 async def main():
@@ -419,17 +553,22 @@ async def main():
             close_tasks = []
             for closed_pos_id in closed_position_ids:
                 pos_info = opened_positions[closed_pos_id]
-                print(
-                    f"❌ Позиция {closed_pos_id} закрыта на главном аккаунте, закрываем на всех остальных...")
+                print(f"❌ Позиция {closed_pos_id} закрыта на главном аккаунте, закрываем на всех остальных...")
+                print(f"📋 Информация о позиции: {pos_info['symbol']}, side={pos_info['side']}, "
+                      f"leverage={pos_info['leverage']}, vol={pos_info['vol']}")
+
+                # ПРОВЕРКА: Убедимся что главный аккаунт доступен
+                print(f"🔍 Проверка главного аккаунта: {main_mexc.cookies.get('u_id', 'N/A')}")
 
                 close_tasks.append(close_positions(
-                    main_mexc,  # Добавляем главный аккаунт
+                    main_mexc,
                     accounts_mexc,
                     pos_info['symbol'],
                     pos_info['side'],
                     pos_info['leverage'],
                     pos_info['vol'],
-                    pos_info['openType']
+                    pos_info['openType'],
+                    pos_info.get('main_position_data')  # ЭТА СТРОКА ДОЛЖНА БЫТЬ
                 ))
 
             await asyncio.gather(*close_tasks)
@@ -455,8 +594,7 @@ async def main():
                 # Проверяем - не появилась ли эта позиция от исполнения лимитного ордера
                 position_key = (symbol, side)
                 if position_key in limit_positions:
-                    print(
-                        f"⏭️ Позиция {positionId} ({symbol}, side={side}) появилась от лимитного ордера - пропускаем")
+                    print(f"⏭️ Позиция {positionId} ({symbol}, side={side}) появилась от лимитного ордера - пропускаем")
                     limit_positions.remove(position_key)
 
                     opened_positions[positionId] = {
@@ -464,12 +602,12 @@ async def main():
                         'side': side,
                         'leverage': leverage,
                         'vol': vol,
-                        'openType': openType
+                        'openType': openType,
+                        'main_position_data': position  # ДОБАВЬТЕ ЭТУ СТРОКУ
                     }
                     continue
 
-                print(
-                    f"🚀 Открываем позицию {positionId} ({symbol}, side={side}) для всех аккаунтов")
+                print(f"🚀 Открываем позицию {positionId} ({symbol}, side={side}) для всех аккаунтов")
 
                 open_tasks.append(open_positions(
                     main_mexc,
@@ -480,7 +618,8 @@ async def main():
                     'side': side,
                     'leverage': leverage,
                     'vol': vol,
-                    'openType': openType
+                    'openType': openType,
+                    'main_position_data': position  # ДОБАВЬТЕ ЭТУ СТРОКУ
                 }
 
             if open_tasks:
