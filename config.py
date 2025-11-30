@@ -4,11 +4,12 @@ DELAY_BETWEEN_CHECK_POSITIONS = 0.3
 # Процент изменения vol относительно главного аккаунта
 # Положительные значения - увеличение, отрицательные - уменьшение
 # Например: VOL_RANDOM_MIN=-20, VOL_RANDOM_MAX=-1 => уменьшение на 1-20%
-VOL_RANDOM_MIN = -20  # Минимальный процент изменения vol
+VOL_RANDOM_MIN = -2  # Минимальный процент изменения vol
 VOL_RANDOM_MAX = -1   # Максимальный процент изменения vol
 
 # Настройки рандомизации кредитного плеча (leverage) для дочерних аккаунтов
-LEVERAGE_RANDOM_MIN = 3   # Минимальное плечо
-LEVERAGE_RANDOM_MAX = 6  # Максимальное плечо
+LEVERAGE_RANDOM_MIN = 5   # Минимальное плечо
+LEVERAGE_RANDOM_MAX = 5  # Максимальное плечо
 TELEGRAM_BOT_TOKEN = "твои значения"
+
 TELEGRAM_CHAT_ID = "твои значения"
